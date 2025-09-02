@@ -1,9 +1,8 @@
-# bot.py — Telegram bot (RU + UZ) с хранением участников в CSV (без SQLite)
+# bot.py — Telegram bot (RU + UZ), CSV-хранилище, /list, toast-уведомление, /export txt|csv
 
 import os
 import csv
 import logging
-import threading
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -52,14 +51,15 @@ I18N = {
                  "Нажимай кнопку \"Участвую\" под постами в канале, чтобы попасть в список участников.\n\n"
                  "Команды:\n"
                  "/lang — выбрать язык\n"
-                 "/post <ru|uz> <текст> — опубликовать пост в канале\n"
-                 "/stats — количество участников\n"
-                 "/export — выгрузка CSV",
+                 "/post <ru|uz> <текст> — пост с кнопкой в канал\n"
+                 "/list [N] — последние N участников (админ)\n"
+                 "/stats — количество участников (админ)\n"
+                 "/export [csv|txt] — выгрузка (админ)",
         "choose_lang": "Выберите язык / Tilni tanlang:",
         "lang_set": "Язык сохранён: Русский 🇷🇺",
         "post_default": "🎉 Розыгрыш! Нажмите \"Участвую\" ниже, чтобы попасть в список.",
         "participate_button": "✅ Участвую | Ishtirok etaman",
-        "participation_ok": "Вы учтены ✅ Удачи!",
+        "thanks_toast": "Спасибо! Вы учтены ✅",
         "not_admin": "Команда доступна только администраторам.",
         "posted": "Пост отправлен в канал (message_id={mid}).",
         "stats": "Всего участников в базе: <b>{n}</b>",
@@ -67,22 +67,29 @@ I18N = {
                 "/start — активировать бота\n"
                 "/lang — выбрать язык\n"
                 "/post <ru|uz> <текст> — (админ) пост с кнопкой\n"
+                "/list [N] — (админ) последние N участников\n"
                 "/stats — (админ) количество участников\n"
-                "/export — (админ) выгрузка CSV\n"
-                "/ping — проверка",
+                "/export [csv|txt] — (админ) выгрузка",
+        "list_empty": "Пока нет участников.",
+        "list_title": "Последние {n} участник(а/ов):",
+        "list_line_username": "• @{u} — {name} (id:{id}) — {ts}",
+        "list_line_noname": "• {name} (id:{id}) — {ts}",
+        "export_done_txt": "TXT экспорт готов.",
+        "export_done_csv": "CSV экспорт готов.",
     },
     "uz": {
         "start": "Salom! Kanal postlari ostidagi \"Ishtirok etaman\" tugmasini bosib, ishtirokingiz qayd etiladi.\n\n"
                  "Buyruqlar:\n"
                  "/lang — tilni tanlash\n"
-                 "/post <ru|uz> <matn> — kanalda post chiqarish\n"
-                 "/stats — ishtirokchilar soni\n"
-                 "/export — CSV yuklab olish",
+                 "/post <ru|uz> <matn> — kanalga tugmali post\n"
+                 "/list [N] — oxirgi N ishtirokchi (admin)\n"
+                 "/stats — ishtirokchilar soni (admin)\n"
+                 "/export [csv|txt] — eksport (admin)",
         "choose_lang": "Tilni tanlang / Выберите язык:",
         "lang_set": "Til saqlandi: Oʻzbekcha 🇺🇿",
         "post_default": "🎉 Tanlov! Roʻyxatga tushish uchun pastdagi \"Ishtirok etaman\" tugmasini bosing.",
         "participate_button": "✅ Ishtirok etaman | Участвую",
-        "participation_ok": "Ishtirokingiz qayd etildi ✅ Omad!",
+        "thanks_toast": "Rahmat! Ishtirokingiz qayd etildi ✅",
         "not_admin": "Bu buyruq faqat administratorlar uchun.",
         "posted": "Post kanalga yuborildi (message_id={mid}).",
         "stats": "Bazadagi ishtirokchilar soni: <b>{n}</b>",
@@ -90,9 +97,15 @@ I18N = {
                 "/start — botni ishga tushirish\n"
                 "/lang — tilni tanlash\n"
                 "/post <ru|uz> <matn> — (admin) tugmali post\n"
+                "/list [N] — (admin) oxirgi N ishtirokchi\n"
                 "/stats — (admin) ishtirokchilar soni\n"
-                "/export — (admin) CSV yuklab olish\n"
-                "/ping — tekshirish",
+                "/export [csv|txt] — (admin) eksport",
+        "list_empty": "Hozircha ishtirokchilar yoʻq.",
+        "list_title": "Oxirgi {n} ishtirokchi:",
+        "list_line_username": "• @{u} — {name} (id:{id}) — {ts}",
+        "list_line_noname": "• {name} (id:{id}) — {ts}",
+        "export_done_txt": "TXT eksport tayyor.",
+        "export_done_csv": "CSV eksport tayyor.",
     },
 }
 def t(lang: str, key: str, **kwargs) -> str:
@@ -102,7 +115,6 @@ def t(lang: str, key: str, **kwargs) -> str:
 
 # ---------- ХРАНИЛИЩЕ CSV ----------
 CSV_HEADER = ["user_id", "username", "full_name", "first_seen", "last_participated", "source", "lang"]
-_store_lock = threading.Lock()
 
 def _ensure_csv():
     if not os.path.exists(CSV_PATH):
@@ -129,59 +141,56 @@ def _save_participants(data: Dict[str, Dict[str, str]]):
     os.replace(tmp, CSV_PATH)
 
 def get_user_lang(user_id: int) -> str:
-    with _store_lock:
-        data = _load_participants()
-        row = data.get(str(user_id))
-        if row and row.get("lang") in LANGS:
-            return row["lang"]
+    data = _load_participants()
+    row = data.get(str(user_id))
+    if row and row.get("lang") in LANGS:
+        return row["lang"]
     return "ru"
 
 def upsert_participant(user_id: int, username: str, full_name: str, source: str, lang: Optional[str] = None) -> None:
     now = datetime.utcnow().isoformat()
-    with _store_lock:
-        data = _load_participants()
-        key = str(user_id)
-        row = data.get(key)
-        if row:
-            row["username"] = username or ""
-            row["full_name"] = full_name or ""
-            row["last_participated"] = now
-            row["source"] = source
-            if lang in LANGS:
-                row["lang"] = lang
-        else:
-            data[key] = {
-                "user_id": key,
-                "username": username or "",
-                "full_name": full_name or "",
-                "first_seen": now,
-                "last_participated": now,
-                "source": source,
-                "lang": lang if lang in LANGS else "ru",
-            }
-        _save_participants(data)
+    data = _load_participants()
+    key = str(user_id)
+    row = data.get(key)
+    if row:
+        row["username"] = username or ""
+        row["full_name"] = full_name or ""
+        row["last_participated"] = now
+        row["source"] = source
+        if lang in LANGS:
+            row["lang"] = lang
+    else:
+        data[key] = {
+            "user_id": key,
+            "username": username or "",
+            "full_name": full_name or "",
+            "first_seen": now,
+            "last_participated": now,
+            "source": source,
+            "lang": lang if lang in LANGS else "ru",
+        }
+    _save_participants(data)
 
 def set_user_lang(user_id: int, lang: str) -> None:
     if lang not in LANGS:
         lang = "ru"
     now = datetime.utcnow().isoformat()
-    with _store_lock:
-        data = _load_participants()
-        key = str(user_id)
-        row = data.get(key)
-        if row:
-            row["lang"] = lang
-        else:
-            data[key] = {
-                "user_id": key,
-                "username": "",
-                "full_name": "",
-                "first_seen": now,
-                "last_participated": now,
-                "source": "lang",
-                "lang": lang,
-            }
-        _save_participants(data)
+    data = _load_participants()
+    key = str(user_id)
+    row = data.get(key)
+    if row:
+        row["lang"] = lang
+    else:
+        data[key] = {
+            "user_id": key,
+            "username": "",
+            "full_name": "",
+            "first_seen": now,
+            "last_participated": now,
+            "source": "lang",
+            "lang": lang,
+        }
+    _save_participants(data)
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -263,10 +272,14 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
-    await q.answer()
 
     user = q.from_user
     lang = get_user_lang(user.id)
+
+    # Показать ТОСТ (без ЛС и без /start)
+    await q.answer(text=t(lang, "thanks_toast"), show_alert=False)
+
+    # Зафиксировать участие
     upsert_participant(
         user_id=user.id,
         username=user.username or "",
@@ -275,15 +288,56 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lang=lang,
     )
 
-    try:
-        await context.bot.send_message(chat_id=user.id, text=t(lang, "participation_ok"))
-    except Exception:
-        pass
-
+    # Разметку можно оставить как есть (без счётчиков)
     try:
         await q.edit_message_reply_markup(reply_markup=q.message.reply_markup)
     except Exception:
         pass
+
+async def list_participants(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin cmd: /list [N] — показать последних N участников (по last_participated)"""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        if update.message:
+            await update.message.reply_text(t(get_user_lang(user.id) if user else "ru", "not_admin"))
+        return
+
+    # Сколько показать
+    try:
+        n = int(context.args[0]) if context.args else 20
+        if n < 1:
+            n = 1
+        if n > 200:
+            n = 200
+    except Exception:
+        n = 20
+
+    data = _load_participants()
+    rows = list(data.values())
+    rows.sort(key=lambda r: r.get("last_participated") or "", reverse=True)
+    rows = rows[:n]
+
+    lang = get_user_lang(user.id)
+    if not rows:
+        await update.message.reply_text(t(lang, "list_empty"))
+        return
+
+    lines = [t(lang, "list_title", n=len(rows))]
+    for r in rows:
+        uid = r.get("user_id", "")
+        uname = r.get("username") or ""
+        fname = r.get("full_name") or ""
+        name = fname.strip() or uname or uid
+        ts = r.get("last_participated", "")
+        if uname:
+            lines.append(t(lang, "list_line_username", u=uname, name=name, id=uid, ts=ts))
+        else:
+            lines.append(t(lang, "list_line_noname", name=name, id=uid, ts=ts))
+
+    text = "\n".join(lines)
+    # Разбить длинные сообщения
+    for chunk_start in range(0, len(text), 3800):
+        await update.message.reply_text(text[chunk_start:chunk_start+3800])
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -292,15 +346,13 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(t(get_user_lang(user.id) if user else "ru", "not_admin"))
         return
 
-    with _store_lock:
-        data = _load_participants()
-        total = len(data)
-        by_lang: Dict[str, int] = {"ru": 0, "uz": 0}
-        for row in data.values():
-            l = row.get("lang") or "ru"
-            if l not in by_lang:
-                by_lang[l] = 0
-            by_lang[l] += 1
+    data = _load_participants()
+    total = len(data)
+    # по языкам
+    by_lang: Dict[str, int] = {"ru": 0, "uz": 0}
+    for row in data.values():
+        l = row.get("lang") or "ru"
+        by_lang[l] = by_lang.get(l, 0) + 1
 
     details = ", ".join([f"{k}: {v}" for k, v in by_lang.items() if v > 0])
     await update.message.reply_text(
@@ -308,15 +360,38 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML
     )
 
-async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin cmd: /export [csv|txt] — по умолчанию csv"""
     user = update.effective_user
     if not user or not is_admin(user.id):
         if update.message:
             await update.message.reply_text(t(get_user_lang(user.id) if user else "ru", "not_admin"))
         return
 
-    _ensure_csv()
-    await update.message.reply_document(InputFile(CSV_PATH), caption="Export")
+    fmt = (context.args[0].lower() if context.args else "csv").strip()
+    if fmt not in ("csv", "txt"):
+        fmt = "csv"
+
+    if fmt == "csv":
+        _ensure_csv()
+        await update.message.reply_document(InputFile(CSV_PATH), caption=t(get_user_lang(user.id), "export_done_csv"))
+        return
+
+    # TXT экспорт
+    data = _load_participants()
+    rows = list(data.values())
+    rows.sort(key=lambda r: r.get("last_participated") or "", reverse=True)
+
+    txt_path = "participants_export.txt"
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("user_id\tusername\tfull_name\tfirst_seen\tlast_participated\tsource\tlang\n")
+        for r in rows:
+            f.write(
+                f"{r.get('user_id','')}\t{r.get('username','')}\t{(r.get('full_name','') or '').replace(chr(9),' ')}\t"
+                f"{r.get('first_seen','')}\t{r.get('last_participated','')}\t{r.get('source','')}\t{r.get('lang','')}\n"
+            )
+
+    await update.message.reply_document(InputFile(txt_path), caption=t(get_user_lang(user.id), "export_done_txt"))
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -338,8 +413,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("lang", cmd_lang))
     app.add_handler(CommandHandler("post", post))
+    app.add_handler(CommandHandler("list", list_participants))
     app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("export", export_csv))
+    app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("ping", ping))
 
     app.add_handler(CallbackQueryHandler(on_setlang, pattern="^setlang:"))
@@ -368,7 +444,6 @@ def main():
             allowed_updates=["message", "callback_query"],
         )
     else:
-        # Если крутите на Render в polling — нужен открытый порт (health), иначе используйте webhook.
         logger.info("Starting POLLING mode…")
         app.run_polling(allowed_updates=["message", "callback_query"])
 
